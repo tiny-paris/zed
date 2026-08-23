@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+if [[ "$(git branch --show-current)" != "neovide-cursor" ]]; then
+  echo "error: switch to the neovide-cursor branch before updating" >&2
+  exit 1
+fi
+
+if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+  echo "error: working tree must be clean before updating" >&2
+  exit 1
+fi
+
+git fetch upstream
+git rebase upstream/main
+
+cargo check -p editor
+cargo test -p editor cursor_animation
+
+script/install-linux
