@@ -17,13 +17,15 @@ use crate::{
     SelectionDragState, SizingBehavior, SoftWrap, ToPoint,
     code_context_menus::{CodeActionsMenu, MENU_ASIDE_MAX_WIDTH, MENU_ASIDE_MIN_WIDTH, MENU_GAP},
     column_pixels,
+    cursor_animation::{CursorViewport, LogicalCursorPosition},
     display_map::{
         Block, BlockContext, BlockStyle, ChunkRendererId, DisplaySnapshot, EditorMargins,
         HighlightKey, HighlightedChunk, ToDisplayPoint,
     },
     editor_settings::{
-        CurrentLineHighlight, DocumentColorsRenderMode, GitGutterWidth, Minimap, MinimapThumb,
-        MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes, ScrollbarDiagnostics, ShowMinimap,
+        CurrentLineHighlight, CursorGlowSettings, DocumentColorsRenderMode, GitGutterWidth,
+        Minimap, MinimapThumb, MinimapThumbBorder, ScrollBeyondLastLine, ScrollbarAxes,
+        ScrollbarDiagnostics, ShowMinimap,
     },
     git::blame::{BlameRenderer, GitBlame, GlobalBlameRenderer},
     hover_popover::{
@@ -42,8 +44,8 @@ use feature_flags::{DiffReviewFeatureFlag, FeatureFlagAppExt as _};
 use git::{Oid, blame::BlameEntry, commit::ParsedCommitMessage};
 use gpui::{
     Action, Along, AnyElement, App, AppContext, AvailableSpace, Axis as ScrollbarAxis, BorderStyle,
-    Bounds, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase, Edges,
-    Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
+    Bounds, BoxShadow, ClipboardItem, ContentMask, Context, Corners, CursorStyle, DispatchPhase,
+    Edges, Element, ElementInputHandler, Entity, Focusable as _, Font, FontId, FontWeight,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InteractiveElement, IntoElement, IsZero,
     ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad,
     ParentElement, Pixels, ScrollHandle, ShapedLine, SharedString, Size,
@@ -81,7 +83,7 @@ use std::{
     ops::{Deref, Range},
     rc::Rc,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use sum_tree::Bias;
 use text::BufferId;
@@ -140,6 +142,7 @@ impl LineNumberStyle {
 
 #[derive(Debug)]
 struct SelectionLayout {
+    id: usize,
     head: DisplayPoint,
     cursor_shape: CursorShape,
     is_newest: bool,
@@ -167,6 +170,7 @@ impl SelectionLayout {
         is_local: bool,
         user_name: Option<SharedString>,
     ) -> Self {
+        let id = selection.id;
         let buffer_snapshot = map.buffer_snapshot();
         let point_selection = selection.map(|p| p.to_point(buffer_snapshot));
         let display_selection = point_selection.map(|p| p.to_display_point(map));
@@ -220,6 +224,7 @@ impl SelectionLayout {
         }
 
         Self {
+            id,
             head,
             cursor_shape,
             is_newest,
@@ -1024,8 +1029,32 @@ impl EditorElement {
         let mut autoscroll_bounds = None;
         let cursor_layouts = self.editor.update(cx, |editor, cx| {
             let mut cursors = Vec::new();
+            let mut handled_animation_cursors = HashSet::default();
+            let mut request_animation_frame = false;
+            let animation_now = Instant::now();
 
             let show_local_cursors = editor.show_local_cursors(window, cx);
+            let cursor_viewport = CursorViewport::new(
+                content_origin,
+                text_hitbox.bounds,
+                scroll_position,
+                scroll_pixel_position,
+                line_height,
+                em_advance,
+            );
+
+            let animation_settings = EditorSettings::get_global(cx).cursor_animation;
+            // Use the selection collection's actual newest id. Deriving this from rendered
+            // SelectionLayouts is unreliable while a mouse selection is pending because Zed may
+            // temporarily coalesce or replace its layout representation.
+            let newest_animation_selection_id = (editor.leader_id.is_none()
+                && supports_neovide_cursor_effect(editor.cursor_shape)
+                && !cx.reduce_motion()
+                && animation_settings.enabled)
+                .then(|| editor.selections.newest_anchor().id);
+            editor
+                .cursor_animations
+                .reconcile_newest_selection(newest_animation_selection_id);
 
             for (player_color, selections) in selections {
                 for selection in selections {
@@ -1165,15 +1194,64 @@ impl EditorElement {
                         shape: selection.cursor_shape,
                         block_text,
                         cursor_name: None,
+                        animated_corners: None,
+                        glow: None,
                     };
+                    let supports_neovide_effect =
+                        supports_neovide_cursor_effect(selection.cursor_shape);
+                    if selection.is_local
+                        && supports_neovide_effect
+                        && !cx.reduce_motion()
+                        && animation_settings.enabled
+                    {
+                        cursor.color = neovide_cursor_color();
+                        cursor.glow = animation_settings
+                            .glow
+                            .enabled
+                            .then_some(animation_settings.glow);
+                    }
                     let cursor_name = selection.user_name.clone().map(|name| CursorName {
                         string: name,
                         color: self.style.background,
                         is_top_row: cursor_position.row().0 == 0,
                     });
                     cursor.layout(content_origin, cursor_name, window, cx);
+                    if selection.is_local {
+                        if supports_neovide_effect
+                            && !cx.reduce_motion()
+                            && animation_settings.enabled
+                        {
+                            handled_animation_cursors.insert(selection.id);
+                            let target_bounds =
+                                window.pixel_snap_bounds(cursor.bounds(content_origin));
+                            cursor.animated_corners = editor.cursor_animations.update(
+                                selection.id,
+                                LogicalCursorPosition {
+                                    row: cursor_position.row().0,
+                                    column: cursor_position.column(),
+                                },
+                                target_bounds,
+                                cursor_viewport,
+                                animation_settings,
+                                animation_now,
+                            );
+                            if cursor.animated_corners.is_some() {
+                                request_animation_frame = true;
+                            }
+                        } else {
+                            editor.cursor_animations.remove(selection.id);
+                        }
+                    }
                     cursors.push(cursor);
                 }
+            }
+
+            editor.cursor_animations.capture_newest_state();
+            editor
+                .cursor_animations
+                .retain(|selection_id| handled_animation_cursors.contains(&selection_id));
+            if request_animation_frame {
+                window.request_animation_frame();
             }
 
             cursors
@@ -6647,6 +6725,7 @@ impl EditorElement {
                         let start = range.start.to_display_point(display_snapshot);
                         let end = range.end.to_display_point(display_snapshot);
                         let selection_layout = SelectionLayout {
+                            id: 0,
                             head: start,
                             range: start..end,
                             cursor_shape: CursorShape::Bar,
@@ -10361,6 +10440,8 @@ pub struct CursorLayout {
     shape: CursorShape,
     block_text: Option<ShapedLine>,
     cursor_name: Option<AnyElement>,
+    animated_corners: Option<[gpui::Point<Pixels>; 4]>,
+    glow: Option<CursorGlowSettings>,
 }
 
 #[derive(Debug)]
@@ -10387,6 +10468,8 @@ impl CursorLayout {
             shape,
             block_text,
             cursor_name: None,
+            animated_corners: None,
+            glow: None,
         }
     }
 
@@ -10457,7 +10540,21 @@ impl CursorLayout {
     }
 
     pub fn paint(&mut self, origin: gpui::Point<Pixels>, window: &mut Window, cx: &mut App) {
+        if let Some(corners) = self.animated_corners {
+            let mut builder = gpui::PathBuilder::fill();
+            builder.add_polygon(&corners, true);
+            if let Ok(path) = builder.build() {
+                self.paint_animated_glow(corners, window);
+                if let Some(name) = &mut self.cursor_name {
+                    name.paint(window, cx);
+                }
+                window.paint_path(path, self.color);
+                return;
+            }
+        }
+
         let bounds = window.pixel_snap_bounds(self.bounds(origin));
+        self.paint_glow(bounds, window);
 
         //Draw background or border quad
         let cursor = if matches!(self.shape, CursorShape::Hollow) {
@@ -10486,9 +10583,75 @@ impl CursorLayout {
         }
     }
 
+    fn paint_glow(&self, bounds: Bounds<Pixels>, window: &mut Window) {
+        let Some((blur_radius, opacity)) = self.glow_parameters() else {
+            return;
+        };
+        let shadow = BoxShadow::new(Pixels::ZERO, Pixels::ZERO, self.color.opacity(opacity))
+            .blur_radius(px(blur_radius));
+        window.paint_drop_shadows(bounds, Corners::default(), &[shadow]);
+    }
+
+    fn paint_animated_glow(&self, corners: [gpui::Point<Pixels>; 4], window: &mut Window) {
+        let Some((blur_radius, opacity)) = self.glow_parameters() else {
+            return;
+        };
+
+        // GPUI's native shadow primitive only accepts axis-aligned Bounds. Using the animated
+        // polygon's bounding box turns a long diagonal cursor jump into a glowing rectangle.
+        // Approximate Canvas shadowBlur with nested translucent strokes instead, so every glow
+        // layer follows the actual jelly contour. These are only painted while animation is
+        // active; the stationary cursor continues to use the single native shadow above.
+        const GLOW_STROKES: [(f32, f32); 4] = [(2.0, 0.08), (1.5, 0.10), (1.0, 0.14), (0.5, 0.22)];
+        for (width_factor, opacity_factor) in GLOW_STROKES {
+            let stroke_width = blur_radius * width_factor;
+            if !stroke_width.is_finite() || stroke_width <= 0.0 {
+                continue;
+            }
+
+            let options = gpui::StrokeOptions::default()
+                .with_line_width(stroke_width)
+                .with_miter_limit(2.0);
+            let mut builder = gpui::PathBuilder::stroke(px(stroke_width))
+                .with_style(gpui::PathStyle::Stroke(options));
+            builder.add_polygon(&corners, true);
+            if let Ok(path) = builder.build() {
+                window.paint_path(path, self.color.opacity(opacity * opacity_factor));
+            }
+        }
+    }
+
+    fn glow_parameters(&self) -> Option<(f32, f32)> {
+        let glow = self.glow?;
+        if !glow.blur_factor.is_finite()
+            || glow.blur_factor <= 0.0
+            || !glow.opacity.is_finite()
+            || glow.opacity <= 0.0
+        {
+            return None;
+        }
+
+        let cursor_width = match self.shape {
+            CursorShape::Bar => px(2.0),
+            _ => self.block_width,
+        };
+        let blur_radius = f32::from(cursor_width.max(self.line_height)) * glow.blur_factor;
+        blur_radius
+            .is_finite()
+            .then_some((blur_radius, glow.opacity.clamp(0.0, 1.0)))
+    }
+
     pub fn shape(&self) -> CursorShape {
         self.shape
     }
+}
+
+fn neovide_cursor_color() -> Hsla {
+    gpui::rgb(0xffc0cb).into()
+}
+
+fn supports_neovide_cursor_effect(shape: CursorShape) -> bool {
+    matches!(shape, CursorShape::Bar | CursorShape::Block)
 }
 
 #[derive(Debug)]
@@ -12230,6 +12393,7 @@ mod tests {
             };
 
             let spanning_selection = SelectionLayout {
+                id: 0,
                 head: DisplayPoint::new(DisplayRow(3), 7),
                 cursor_shape: CursorShape::Bar,
                 is_newest: true,
@@ -12279,6 +12443,7 @@ mod tests {
             };
 
             let selection = SelectionLayout {
+                id: 0,
                 head: DisplayPoint::new(DisplayRow(2), 0),
                 cursor_shape: CursorShape::Bar,
                 is_newest: true,
@@ -12477,6 +12642,24 @@ mod tests {
 
         // line height is close to 1/4 the target height
         assert_eq!(EditorElement::spacer_pattern_period(20.0, 4.8), 5.0);
+    }
+
+    #[test]
+    fn cursor_animation_supports_bar_and_block_shapes() {
+        assert!(supports_neovide_cursor_effect(CursorShape::Bar));
+        assert!(supports_neovide_cursor_effect(CursorShape::Block));
+        assert!(!supports_neovide_cursor_effect(CursorShape::Underline));
+        assert!(!supports_neovide_cursor_effect(CursorShape::Hollow));
+    }
+
+    #[test]
+    fn cursor_animation_uses_reference_cursor_color() {
+        let actual = neovide_cursor_color().to_rgb();
+        let expected = gpui::rgb(0xffc0cb);
+        assert!((actual.r - expected.r).abs() < 1e-6);
+        assert!((actual.g - expected.g).abs() < 1e-6);
+        assert!((actual.b - expected.b).abs() < 1e-6);
+        assert_eq!(actual.a, expected.a);
     }
 
     #[gpui::test(iterations = 100)]

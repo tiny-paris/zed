@@ -22,6 +22,8 @@ pub struct EditorSettingsContent {
     ///
     /// Default: bar
     pub cursor_shape: Option<CursorShape>,
+    /// Neovide-style cursor movement animation settings.
+    pub cursor_animation: Option<CursorAnimationSettingsContent>,
     /// Determines how snippets are sorted relative to other completion items.
     ///
     /// Default: inline
@@ -277,7 +279,7 @@ pub struct EditorSettingsContent {
     /// switches to unified mode and switches back when the editor is wide
     /// enough. Set to 0 to disable automatic switching.
     ///
-    /// Default: 100
+    /// Default: 125
     pub minimum_split_diff_width: Option<f32>,
 }
 
@@ -356,6 +358,48 @@ impl RelativeLineNumbers {
             RelativeLineNumbers::Wrapped => true,
         }
     }
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct CursorAnimationSettingsContent {
+    /// Whether Neovide-style cursor movement animation is enabled.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Duration in milliseconds for cursor movement across rows or over longer distances.
+    ///
+    /// Default: 100
+    pub duration_ms: Option<u64>,
+    /// Duration in milliseconds for short horizontal cursor movement.
+    ///
+    /// Default: 50
+    pub short_duration_ms: Option<u64>,
+    /// Difference in spring duration between leading and trailing cursor corners.
+    /// Values are clamped to the range 0 to 1.
+    ///
+    /// Default: 1.0
+    pub trail_size: Option<f32>,
+    /// Glow drawn around the animated cursor using the Neovide cursor color.
+    pub glow: Option<CursorGlowSettingsContent>,
+}
+
+#[with_fallible_options]
+#[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq)]
+pub struct CursorGlowSettingsContent {
+    /// Whether to draw a glow around the cursor.
+    ///
+    /// Default: true
+    pub enabled: Option<bool>,
+    /// Glow blur radius as a factor of the cursor's largest dimension.
+    /// Negative values are treated as zero.
+    ///
+    /// Default: 0.5
+    pub blur_factor: Option<f32>,
+    /// Glow opacity. Values are clamped to the range 0 to 1.
+    ///
+    /// Default: 1.0
+    pub opacity: Option<f32>,
 }
 
 // Toolbar related settings
