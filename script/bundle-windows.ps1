@@ -1,3 +1,5 @@
+#requires -Version 7.3
+
 [CmdletBinding()]
 Param(
     [Parameter()][Alias('i')][switch]$Install,
@@ -14,6 +16,7 @@ $PSNativeCommandUseErrorActionPreference = $true
 
 $buildSuccess = $false
 $canCodeSign = $false
+$setupPath = $null
 
 $OSArchitecture = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture) {
     "X64" { "x86_64" }
@@ -40,8 +43,50 @@ function Get-VSArch {
     }
 }
 
+function Find-VsDevShell {
+    $visualStudioRoots = @(
+        "$env:ProgramFiles\Microsoft Visual Studio",
+        "${env:ProgramFiles(x86)}\Microsoft Visual Studio"
+    ) | Where-Object { Test-Path -LiteralPath $_ }
+
+    $devShell = $visualStudioRoots |
+        ForEach-Object { Get-ChildItem -LiteralPath $_ -Filter 'Launch-VsDevShell.ps1' -File -Recurse -ErrorAction SilentlyContinue } |
+        Sort-Object FullName -Descending |
+        Select-Object -First 1
+
+    if (-not $devShell) {
+        throw 'A Visual Studio installation with the C++ build tools was not found'
+    }
+
+    return $devShell.FullName
+}
+
+function Find-MakeAppx {
+    $windowsKitsBin = "${env:ProgramFiles(x86)}\Windows Kits\10\bin"
+    if (-not (Test-Path -LiteralPath $windowsKitsBin)) {
+        throw 'The Windows 10/11 SDK was not found'
+    }
+
+    $sdkHostArch = if ($OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }
+    $makeAppx = Get-ChildItem -LiteralPath $windowsKitsBin -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '^\d+(\.\d+){2,3}$' } |
+        Sort-Object { [version]$_.Name } -Descending |
+        ForEach-Object { Join-Path $_.FullName "$sdkHostArch\makeAppx.exe" } |
+        Where-Object { Test-Path -LiteralPath $_ } |
+        Select-Object -First 1
+
+    if (-not $makeAppx) {
+        throw "makeAppx.exe was not found in the installed Windows SDKs for $sdkHostArch"
+    }
+
+    return $makeAppx
+}
+
+$vsDevShell = Find-VsDevShell
+$makeAppx = Find-MakeAppx
+
 Push-Location
-& "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\Launch-VsDevShell.ps1" -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
+& $vsDevShell -Arch (Get-VSArch -Arch $Architecture) -HostArch (Get-VSArch -Arch $OSArchitecture)
 Pop-Location
 
 $target = "$Architecture-pc-windows-msvc"
@@ -207,10 +252,7 @@ function MakeAppx {
         }
     }
     Copy-Item -Path "$manifestFile" -Destination "$innoDir\make_appx\AppxManifest.xml"
-    # Add makeAppx.exe to Path
-    $sdk = "C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64"
-    $env:Path += ';' + $sdk
-    makeAppx.exe pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
+    & $makeAppx pack /d "$innoDir\make_appx" /p "$innoDir\zed_explorer_command_injector.appx" /nv
 }
 
 function SignZedAndItsFriends {
@@ -222,12 +264,36 @@ function SignZedAndItsFriends {
     & "$innoDir\sign.ps1" $files
 }
 
+function DownloadFile {
+    param(
+        [string]$Url,
+        [string]$Destination
+    )
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Invoke-WebRequest -Uri $Url -OutFile $Destination
+            return
+        }
+        catch {
+            if (Test-Path -LiteralPath $Destination) {
+                Remove-Item -LiteralPath $Destination -Force
+            }
+            if ($attempt -eq 3) {
+                throw
+            }
+            Write-Warning "Download attempt $attempt failed: $_"
+            Start-Sleep -Seconds 2
+        }
+    }
+}
+
 function DownloadAMDGpuServices {
     # If you update the AGS SDK version, please also update the version in `crates/gpui/src/platform/windows/directx_renderer.rs`
     $url = "https://codeload.github.com/GPUOpen-LibrariesAndSDKs/AGS_SDK/zip/refs/tags/v6.3.0"
     $zipPath = ".\AGS_SDK_v6.3.0.zip"
     # Download the AGS SDK zip file
-    Invoke-WebRequest -Uri $url -OutFile $zipPath
+    DownloadFile -Url $url -Destination $zipPath
     # Extract the AGS SDK zip file
     Expand-Archive -Path $zipPath -DestinationPath "." -Force
 }
@@ -235,7 +301,7 @@ function DownloadAMDGpuServices {
 function DownloadConpty {
     $url = "https://github.com/microsoft/terminal/releases/download/v1.23.13503.0/Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg"
     $zipPath = ".\Microsoft.Windows.Console.ConPTY.1.23.251216003.nupkg"
-    Invoke-WebRequest -Uri $url -OutFile $zipPath
+    DownloadFile -Url $url -Destination $zipPath
     Expand-Archive -Path $zipPath -DestinationPath ".\conpty" -Force
 }
 
@@ -328,7 +394,15 @@ function BuildInstaller {
     # Windows runner 2022 default has iscc in PATH, https://github.com/actions/runner-images/blob/main/images/windows/Windows2022-Readme.md
     # Currently, we are using Windows 2022 runner.
     # Windows runner 2025 doesn't have iscc in PATH for now, https://github.com/actions/runner-images/issues/11228
-    $innoSetupPath = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+    $innoSetupPath = @(
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
+        "C:\Program Files\Inno Setup 6\ISCC.exe",
+        "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+
+    if (-not $innoSetupPath) {
+        throw "Inno Setup 6 was not found"
+    }
 
     $definitions = @{
         "AppId"          = $appId
@@ -367,7 +441,10 @@ function BuildInstaller {
 
     if ($process.ExitCode -eq 0) {
         Write-Host "✅ Inno Setup successfully compiled the installer"
-        Write-Output "SETUP_PATH=target/$appSetupName.exe" >> $env:GITHUB_ENV
+        $script:setupPath = Join-Path $env:ZED_WORKSPACE "target\$appSetupName.exe"
+        if ($env:GITHUB_ENV) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "SETUP_PATH=target/$appSetupName.exe"
+        }
         $script:buildSuccess = $true
     }
     else {
@@ -383,14 +460,14 @@ $debugStoreKey = "$env:ZED_RELEASE_CHANNEL/zed-$env:RELEASE_VERSION-$env:ZED_REL
 
 CheckEnvironmentVariables
 PrepareForBundle
+DownloadAMDGpuServices
+DownloadConpty
 GenerateLicenses
 BuildZedAndItsFriends
 BuildRemoteServer
 MakeAppx
 SignZedAndItsFriends
 ZipZedAndItsFriendsDebug
-DownloadAMDGpuServices
-DownloadConpty
 CollectFiles
 BuildInstaller
 
@@ -402,7 +479,10 @@ if ($buildSuccess) {
     Write-Output "Build successful"
     if ($Install) {
         Write-Output "Installing Zed..."
-        Start-Process -FilePath "$env:ZED_WORKSPACE/target/ZedEditorUserSetup-x64-$env:RELEASE_VERSION.exe"
+        if (-not $setupPath -or -not (Test-Path -LiteralPath $setupPath)) {
+            throw "Installer was not generated: $setupPath"
+        }
+        Start-Process -FilePath $setupPath -Wait
     }
     exit 0
 }

@@ -5,18 +5,35 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
+upstream_url="https://github.com/zed-industries/zed.git"
+
 if [[ "$(git branch --show-current)" != "neovide-cursor" ]]; then
   echo "error: switch to the neovide-cursor branch before updating" >&2
   exit 1
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet || [[ -n "$(git ls-files --others --exclude-standard)" ]]; then
+if [[ -n "$(git status --porcelain)" ]]; then
   echo "error: working tree must be clean before updating" >&2
   exit 1
 fi
 
-git fetch upstream
-git rebase upstream/main
+if git remote get-url upstream >/dev/null 2>&1; then
+  if [[ "$(git remote get-url upstream)" != "$upstream_url" ]]; then
+    echo "error: upstream points to an unexpected repository" >&2
+    exit 1
+  fi
+else
+  git remote add upstream "$upstream_url"
+fi
+
+previous_head="$(git rev-parse HEAD)"
+git fetch upstream main
+
+if ! git rebase upstream/main; then
+  echo "error: rebase failed; resolve conflicts and run git rebase --continue" >&2
+  echo "previous HEAD: $previous_head" >&2
+  exit 1
+fi
 
 cargo check -p editor
 cargo test -p editor cursor_animation

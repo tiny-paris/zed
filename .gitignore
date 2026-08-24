@@ -2,6 +2,11 @@
 **/*.proptest-regressions
 **/cargo-target
 **/target
+/AGS_SDK-*/
+/AGS_SDK_v*.zip
+/Microsoft.Windows.Console.ConPTY.*.nupkg
+/conpty/
+/inno/
 .webrtc-sys/
 **/venv
 **/.direnv
